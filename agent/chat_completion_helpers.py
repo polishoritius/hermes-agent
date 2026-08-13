@@ -494,6 +494,20 @@ def _bedrock_reasoning_stale_floor(model_id: object) -> "float | None":
     return None
 
 
+def _activate_fallback(agent, reason=None) -> bool:
+    """Activate the next fallback provider, unless fallback is disabled.
+
+    The isolated one-shot runtime sets ``agent._fallback_disabled`` and must
+    never enter the provider-switch path at all — not even to have it decline.
+    Guarding here (rather than inside ``_try_activate_fallback``) keeps the
+    activation function genuinely uncalled, which is the property isolated
+    mode is asserted on. Every other caller behaves exactly as before.
+    """
+    if getattr(agent, "_fallback_disabled", False):
+        return False
+    return agent._try_activate_fallback(reason)
+
+
 def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
     """Run one non-streaming LLM request for the active api_mode and return it.
 
@@ -1980,11 +1994,11 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         agent._unavailable_fallback_keys = unavailable
     if fb_key in unavailable:
         logger.debug("Fallback skip: %s previously marked unavailable", fb_key)
-        return agent._try_activate_fallback(reason)
+        return _activate_fallback(agent, reason)
     fb_provider = (fb.get("provider") or "").strip().lower()
     fb_model = (fb.get("model") or "").strip()
     if not fb_provider or not fb_model:
-        return agent._try_activate_fallback(reason)  # skip invalid, try next
+        return _activate_fallback(agent, reason)  # skip invalid, try next
 
     local_skip_reason = _fallback_entry_unavailable_without_network(agent, fb)
     if local_skip_reason:
@@ -1995,7 +2009,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             fb_model,
             local_skip_reason,
         )
-        return agent._try_activate_fallback(reason)
+        return _activate_fallback(agent, reason)
 
     # Skip entries that resolve to the same backend that just failed —
     # falling back to it loops the failure. Identity semantics (which axes
@@ -2020,7 +2034,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             "as the current one (%s)",
             fb_provider, fb_model, current_ident.base_url or current_ident.provider,
         )
-        return agent._try_activate_fallback(reason)
+        return _activate_fallback(agent, reason)
 
     # Use centralized router for client construction.
     # raw_codex=True because the main agent needs direct responses.stream()
@@ -2050,7 +2064,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 "Fallback to %s failed: provider not configured",
                 fb_provider)
             unavailable.add(fb_key)
-            return agent._try_activate_fallback(reason)  # try next in chain
+            return _activate_fallback(agent, reason)  # try next in chain
         try:
             from hermes_cli.model_normalize import normalize_model_for_provider
 
@@ -2305,7 +2319,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         if fb_provider == "nous":
             unavailable.add(fb_key)
         logger.error("Failed to activate fallback %s: %s", fb_model, e)
-        return agent._try_activate_fallback(reason)  # try next in chain
+        return _activate_fallback(agent, reason)  # try next in chain
 
 
 

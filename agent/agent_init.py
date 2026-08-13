@@ -532,6 +532,10 @@ def init_agent(
     checkpoint_max_file_size_mb: int = 10,
     pass_session_id: bool = False,
     requested_provider: str = None,
+    persist_session: bool = True,
+    minimal_system_prompt: bool = False,
+    api_max_attempts: int = None,
+    isolated_runtime: bool = False,
 ):
     """
     Initialize the AI Agent.
@@ -619,6 +623,21 @@ def init_agent(
     # skip_memory=True already disables the memory-review trigger; this
     # flag is the explicit single-switch off for both review paths.
     agent.skip_background_review = bool(skip_background_review)
+    # When True, build_system_prompt_parts() emits a generic assistant identity
+    # and nothing else — no SOUL, memory, context files, skills index, tool
+    # instructions, workspace/cwd snapshot, profile paths, or env probe. Used
+    # by the isolated one-shot runtime so no local/personal content is sent.
+    agent._minimal_system_prompt = bool(minimal_system_prompt)
+    # Isolated runtime marker. Gates the outbound side-effects that are not
+    # already covered by the individual skip_* / persist_session flags:
+    # provider metadata pre-warm, the live context-length probe, and fallback
+    # activation. Checked via getattr() at each site so agents built by paths
+    # that bypass init_agent keep today's behaviour.
+    agent._isolated_runtime = bool(isolated_runtime)
+    # When True, _try_activate_fallback() is never CALLED (not merely made to
+    # return False): isolated mode must not reach the provider-switch path at
+    # all, even to decline it.
+    agent._fallback_disabled = bool(isolated_runtime)
     agent.pass_session_id = pass_session_id
     agent.log_prefix_chars = log_prefix_chars
     agent.log_prefix = f"{log_prefix} " if log_prefix else ""
@@ -750,7 +769,13 @@ def init_agent(
     # AIAgent is created for every gateway request, so without the guard
     # each message leaks one OS thread and the process eventually exhausts
     # the system thread limit (RuntimeError: can't start new thread).
-    if (agent.provider == "openrouter" or agent._is_openrouter_url()) and \
+    # Isolated runtime: never pre-warm. This is an outbound HTTPS request to
+    # the provider's metadata API that the caller did not ask for, and it
+    # writes the provider metadata cache to disk — both of which isolated mode
+    # promises not to do.
+    if isolated_runtime:
+        pass
+    elif (agent.provider == "openrouter" or agent._is_openrouter_url()) and \
             not _ra()._openrouter_prewarm_done.is_set():
         _ra()._openrouter_prewarm_done.set()
         threading.Thread(
@@ -1616,7 +1641,10 @@ def init_agent(
     # (state.db) or the JSON snapshot, regardless of session_id. Set on the
     # background skill/memory review fork so its harness turn can't leak into
     # the user's real session and hijack the next live turn. Default False.
-    agent._persist_disabled = False
+    # ``persist_session=False`` is the constructor-level form of the same
+    # switch, used by the isolated one-shot runtime so the guarantee is in
+    # effect for the whole of init (rather than patched on afterwards).
+    agent._persist_disabled = not persist_session
     agent._session_init_model_config = {
         "max_iterations": agent.max_iterations,
         "reasoning_config": reasoning_config,
@@ -1869,6 +1897,15 @@ def init_agent(
         _api_retries = max(_api_retries, 1)  # 1 = no retry (single attempt)
     except (TypeError, ValueError):
         _api_retries = 3
+    # An explicit api_max_attempts overrides config entirely. Isolated mode
+    # passes 1 so "exactly one HTTP attempt" cannot be widened by a user's
+    # agent.api_max_retries setting. (_api_max_retries counts ATTEMPTS: the
+    # loop is `while retry_count < max_retries`, so 1 == a single attempt.)
+    if api_max_attempts is not None:
+        try:
+            _api_retries = max(int(api_max_attempts), 1)
+        except (TypeError, ValueError):
+            pass
     agent._api_max_retries = _api_retries
 
     # Initialize context compressor for automatic context management
@@ -2425,6 +2462,16 @@ def init_agent(
         _config_context_length,
         _lmstudio_runtime_context_length,
     )
+    if isolated_runtime and not _effective_context_length:
+        # Pin the window to the standard top probe tier so the compressor
+        # never runs get_model_context_length()'s live /models probe — that
+        # is an extra outbound request to the provider (and a metadata-cache
+        # write) on top of the single completion call isolated mode allows.
+        # A one-shot turn with no tools cannot approach any of these limits,
+        # so the exact value is immaterial to behaviour here.
+        from agent.model_metadata import CONTEXT_PROBE_TIERS
+
+        _effective_context_length = CONTEXT_PROBE_TIERS[0]
 
 
 

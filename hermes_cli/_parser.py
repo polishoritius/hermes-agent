@@ -37,6 +37,40 @@ def _inherited_flag(parser, *args, **kwargs):
     return action
 
 
+# Message shown when --isolated is passed without a one-shot prompt. Kept as a
+# module constant so tests and every dispatch path assert on the same text.
+ISOLATED_REQUIRES_ONESHOT_ERROR = (
+    "hermes: --isolated requires -z/--oneshot. Isolated mode is a one-shot-only "
+    "runtime (no session, no memory, no tools); there is no interactive form of "
+    "it. Re-run as: hermes -z \"<prompt>\" --isolated"
+)
+
+
+def isolated_oneshot_active(args) -> bool:
+    """True when this invocation is a *valid* isolated one-shot run.
+
+    Deliberately requires the one-shot prompt to be present as well, so a
+    caller that forgets :func:`validate_isolated_oneshot` can never silently
+    turn a non-one-shot invocation into an isolated one.
+    """
+    return bool(
+        getattr(args, "isolated_oneshot", False) and getattr(args, "oneshot", None)
+    )
+
+
+def validate_isolated_oneshot(args) -> str | None:
+    """Return an error message when --isolated was used without --oneshot.
+
+    Returns ``None`` when the combination is valid (or --isolated absent).
+    Hard error rather than silently enabling one-shot: isolated mode changes
+    what is sent to the provider, so an ambiguous invocation must not be
+    guessed at.
+    """
+    if getattr(args, "isolated_oneshot", False) and not getattr(args, "oneshot", None):
+        return ISOLATED_REQUIRES_ONESHOT_ERROR
+    return None
+
+
 _EPILOGUE = """
 Examples:
     hermes                        Start interactive chat
@@ -123,6 +157,27 @@ def build_top_level_parser():
             "(estimated cost, token counts, model, api_calls) to PATH. "
             "The report is written even when the run fails, so pipelines "
             "can always account for spend. No effect outside -z/--oneshot."
+        ),
+    )
+    parser.add_argument(
+        "--isolated",
+        # NOTE: dest is deliberately NOT "isolated" — the `serve` subparser
+        # already owns a `--isolated` flag (dedicated per-profile dashboard
+        # server) whose dest is `isolated`. argparse lets a subparser's
+        # default overwrite a top-level value of the same dest, so sharing
+        # the name would both corrupt `hermes serve --isolated` and make the
+        # "requires -z" check below fire on it.
+        dest="isolated_oneshot",
+        action="store_true",
+        default=False,
+        help=(
+            "One-shot mode only: run the prompt under a hardened, fully "
+            "isolated runtime. No session/message persistence, no memory, no "
+            "context files (AGENTS.md/SOUL.md/...), no tools, no MCP servers, "
+            "no plugins, no hooks, no delegation, no fallback provider, and "
+            "exactly one HTTP attempt. The system prompt is reduced to a "
+            "generic assistant identity — no local paths, profile, or user "
+            "data is sent. Requires -z/--oneshot; erroring out otherwise."
         ),
     )
     # --model / --provider are accepted at the top level so they can pair

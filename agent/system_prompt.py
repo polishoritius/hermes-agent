@@ -167,6 +167,20 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     session — that's the only way to keep upstream prompt caches
     warm across turns.
     """
+    # Minimal prompt (isolated one-shot): a generic assistant identity and
+    # nothing else. Deliberately a short-circuit rather than a gate on each of
+    # the ~40 blocks below — several of them (SOUL.md, the workspace snapshot,
+    # the active-profile hint, the environment probe, context files, the memory
+    # and USER.md blocks) embed local paths, the username, or repo content, and
+    # an opt-out list would silently regress the moment a new block is added.
+    # Anything that must reach the provider in this mode has to be added here
+    # explicitly.
+    if getattr(agent, "_minimal_system_prompt", False):
+        minimal = DEFAULT_AGENT_IDENTITY
+        if system_message:
+            minimal = f"{minimal}\n\n{system_message.strip()}"
+        return {"stable": minimal, "context": "", "volatile": ""}
+
     # Local import to avoid pulling model_tools at module load.  Tests
     # patch ``run_agent.get_toolset_for_tool`` and similar helpers, so
     # we resolve through ``_ra()`` to honor those patches.

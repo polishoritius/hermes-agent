@@ -173,6 +173,25 @@ def _cleanup_oneshot_runtime() -> None:
         pass
 
 
+def _enforce_isolated_requires_oneshot(args) -> None:
+    """Hard-fail when ``--isolated`` was passed without a one-shot prompt.
+
+    Called right after every top-level ``parse_args`` so the error surfaces
+    identically on the fast-chat, Termux, and full-dispatch paths. Exit code 2
+    matches the other one-shot usage errors in ``hermes_cli.oneshot``.
+    """
+    from hermes_cli._parser import validate_isolated_oneshot
+
+    error = validate_isolated_oneshot(args)
+    if error:
+        sys.stderr.write(error + "\n")
+        try:
+            sys.stderr.flush()
+        except Exception:
+            pass
+        raise SystemExit(2)
+
+
 def _run_and_exit_oneshot(
     prompt: str,
     *,
@@ -180,6 +199,7 @@ def _run_and_exit_oneshot(
     provider: object = None,
     toolsets: object = None,
     usage_file: object = None,
+    isolated: bool = False,
 ) -> None:
     try:
         from hermes_cli.oneshot import run_oneshot
@@ -190,6 +210,7 @@ def _run_and_exit_oneshot(
             provider=provider,
             toolsets=toolsets,
             usage_file=usage_file,
+            isolated=isolated,
         )
     except KeyboardInterrupt:
         rc = 130
@@ -10847,6 +10868,18 @@ def _prepare_agent_startup(args) -> None:
         os.environ["HERMES_YOLO_MODE"] = "1"
     _apply_safe_mode(args)
 
+    # Isolated one-shot: no plugin discovery, no MCP discovery/connection, no
+    # shell-hook or outbound-webhook registration. This is the single
+    # chokepoint for all three one-shot dispatch paths (fast CLI launch,
+    # Termux fast CLI, full dispatch), so the guarantee holds even if a future
+    # caller forgets to gate its own call site. Safe mode is still applied
+    # above: isolated is a strictly stronger contract layered on top of it,
+    # never a replacement for it.
+    from hermes_cli._parser import isolated_oneshot_active
+
+    if isolated_oneshot_active(args):
+        return
+
     _sub_attr, _sub_set = _AGENT_SUBCOMMANDS.get(args.command, (None, None))
     if not (
         args.command in _AGENT_COMMANDS
@@ -10996,6 +11029,10 @@ def _try_fast_chat_launch() -> bool:
         # Flags the light parser doesn't know — could belong to a plugin
         # subcommand or a newer full-parser flag. Fall back to full dispatch.
         return False
+    # Deliberately outside the try above: its `except SystemExit: return False`
+    # would swallow the exit and let full dispatch re-report the same error,
+    # printing it twice.
+    _enforce_isolated_requires_oneshot(args)
     if getattr(args, "version", False):
         return False
     if getattr(args, "command", None) not in {None, "chat"}:
@@ -11012,6 +11049,7 @@ def _try_fast_chat_launch() -> bool:
             provider=getattr(args, "provider", None),
             toolsets=getattr(args, "toolsets", None),
             usage_file=getattr(args, "usage_file", None),
+            isolated=getattr(args, "isolated_oneshot", False),
         )
 
     if (args.resume or args.continue_last) and args.command is None:
@@ -11055,6 +11093,7 @@ def _try_termux_fast_cli_launch() -> bool:
     parser, _subparsers, chat_parser = build_top_level_parser()
     chat_parser.set_defaults(func=cmd_chat)
     args = parser.parse_args(_coalesce_session_name_args(argv))
+    _enforce_isolated_requires_oneshot(args)
 
     if getattr(args, "version", False):
         _print_version_info(check_updates=False)
@@ -11068,6 +11107,7 @@ def _try_termux_fast_cli_launch() -> bool:
             provider=getattr(args, "provider", None),
             toolsets=getattr(args, "toolsets", None),
             usage_file=getattr(args, "usage_file", None),
+            isolated=getattr(args, "isolated_oneshot", False),
         )
 
     if (args.resume or args.continue_last) and args.command is None:
@@ -11120,6 +11160,7 @@ def _try_termux_fast_tui_launch() -> bool:
     parser, _subparsers, chat_parser = build_top_level_parser()
     chat_parser.set_defaults(func=cmd_chat)
     args = parser.parse_args(_coalesce_session_name_args(sys.argv[1:]))
+    _enforce_isolated_requires_oneshot(args)
 
     # Preserve top-level behaviours whose semantics are not "launch chat/TUI".
     if getattr(args, "version", False) or getattr(args, "oneshot", None):
@@ -12732,6 +12773,8 @@ def main():
         subparsers.required = False
         args = parser.parse_args(_processed_argv)
 
+    _enforce_isolated_requires_oneshot(args)
+
     # Handle --version flag
     if args.version:
         cmd_version(args)
@@ -12762,6 +12805,7 @@ def main():
             provider=getattr(args, "provider", None),
             toolsets=getattr(args, "toolsets", None),
             usage_file=getattr(args, "usage_file", None),
+            isolated=getattr(args, "isolated_oneshot", False),
         )
 
     # Handle top-level --resume / --continue as shortcut to chat

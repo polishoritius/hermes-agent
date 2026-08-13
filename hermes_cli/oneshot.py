@@ -167,12 +167,55 @@ def _write_usage_file(path: Optional[str], result: dict, failure: Optional[str] 
         pass
 
 
+# Environment variables that mark this process as a Kanban worker /
+# dispatcher-owned delegation context. Isolated mode refuses to run under any
+# of them rather than stripping them: ``model_tools._compute_tool_definitions``
+# FORCE-ADDS the "kanban" toolset for a dispatcher-owned worker even when the
+# caller passed ``enabled_toolsets=[]``, so silently continuing would hand the
+# run a live worker tool surface. Fail closed instead.
+_WORKER_CONTEXT_ENV_VARS = ("HERMES_KANBAN_TASK", "HERMES_KANBAN_BOARD")
+
+
+def _isolated_precondition_error(
+    toolsets: object, usage_file: Optional[str]
+) -> Optional[str]:
+    """Validate an isolated-mode invocation. Returns an error string or None.
+
+    Every check fails closed: isolated mode promises a fixed runtime shape, so
+    an argument that contradicts that shape is an error rather than something
+    to silently override.
+    """
+    present = [
+        name for name in _WORKER_CONTEXT_ENV_VARS if os.environ.get(name, "").strip()
+    ]
+    if present:
+        return (
+            "hermes -z --isolated: refusing to run inside a Kanban worker / "
+            f"delegation context ({', '.join(present)} set). Isolated mode cannot "
+            "guarantee a zero-tool runtime here — dispatcher-owned workers are "
+            "granted the kanban toolset regardless of the requested toolsets. "
+            "Run isolated mode from a plain shell instead.\n"
+        )
+    if _normalize_toolsets(toolsets) is not None:
+        return (
+            "hermes -z --isolated: --toolsets cannot be combined with --isolated. "
+            "Isolated mode runs with no tools at all.\n"
+        )
+    if usage_file:
+        return (
+            "hermes -z --isolated: --usage-file cannot be combined with --isolated. "
+            "Isolated mode writes no runtime artifacts.\n"
+        )
+    return None
+
+
 def run_oneshot(
     prompt: str,
     model: Optional[str] = None,
     provider: Optional[str] = None,
     toolsets: object = None,
     usage_file: Optional[str] = None,
+    isolated: bool = False,
 ) -> int:
     """Execute a single prompt and print only the final content block.
 
@@ -210,16 +253,30 @@ def run_oneshot(
         )
         return 2
 
-    explicit_toolsets, toolsets_error = _validate_explicit_toolsets(toolsets)
-    if toolsets_error:
-        sys.stderr.write(toolsets_error)
-        return 2
-    use_config_toolsets = _normalize_toolsets(toolsets) is None
+    if isolated:
+        # Validated before the stderr redirect so the message reaches the
+        # terminal, and before any agent/tool import runs.
+        isolated_error = _isolated_precondition_error(toolsets, usage_file)
+        if isolated_error:
+            sys.stderr.write(isolated_error)
+            return 2
+        explicit_toolsets = []
+        use_config_toolsets = False
+    else:
+        explicit_toolsets, toolsets_error = _validate_explicit_toolsets(toolsets)
+        if toolsets_error:
+            sys.stderr.write(toolsets_error)
+            return 2
+        use_config_toolsets = _normalize_toolsets(toolsets) is None
 
-    # Auto-approve any shell / tool approvals.  Non-interactive by
-    # definition — a prompt would hang forever.
-    os.environ["HERMES_YOLO_MODE"] = "1"
-    os.environ["HERMES_ACCEPT_HOOKS"] = "1"
+    if not isolated:
+        # Auto-approve any shell / tool approvals.  Non-interactive by
+        # definition — a prompt would hang forever.
+        #
+        # Skipped in isolated mode: there are no tools to approve and no hooks
+        # registered, so widening the approval posture would be pure downside.
+        os.environ["HERMES_YOLO_MODE"] = "1"
+        os.environ["HERMES_ACCEPT_HOOKS"] = "1"
 
     # One-shot prints a single final response and exits: there is no later turn
     # for a detached subagent's completion to re-enter, and nothing here drains
@@ -248,6 +305,7 @@ def run_oneshot(
                     provider=provider,
                     toolsets=explicit_toolsets,
                     use_config_toolsets=use_config_toolsets,
+                    isolated=isolated,
                 )
             except BaseException as exc:  # noqa: BLE001
                 # Capture anything that escapes the agent (including OSError
@@ -325,6 +383,7 @@ def _run_agent(
     provider: Optional[str] = None,
     toolsets: object = None,
     use_config_toolsets: bool = True,
+    isolated: bool = False,
 ) -> tuple[str, dict]:
     """Build an AIAgent exactly like a normal CLI chat turn would, then
     run a single conversation.  Returns ``(final_response, run_result)``."""
@@ -403,6 +462,10 @@ def _run_agent(
     toolsets_list = _normalize_toolsets(toolsets)
     if toolsets_list is None and use_config_toolsets:
         toolsets_list = sorted(_get_platform_tools(cfg, "cli"))
+    if isolated:
+        # Empty list (NOT None): get_tool_definitions treats None as "every
+        # toolset" and only an explicit empty list as "no toolsets".
+        toolsets_list = []
 
     # Ensure MCP tools are discovered before building the agent.  Oneshot
     # bypasses cli.py's _prepare_agent_startup MCP background path and
@@ -411,14 +474,21 @@ def _run_agent(
     # registered yet.  This helper starts discovery if needed (idempotent) and
     # bounded-waits with the larger single-query bound (default 15s) because
     # there is only ONE turn and no between-turns late-binding refresh (#38448).
-    from hermes_cli.mcp_startup import ensure_mcp_discovery_before_agent_build
+    #
+    # Isolated mode skips discovery entirely — it exposes no tools, so there is
+    # nothing for an MCP server to contribute, and connecting to one would
+    # start external processes this mode promises not to start.
+    if not isolated:
+        from hermes_cli.mcp_startup import ensure_mcp_discovery_before_agent_build
 
-    ensure_mcp_discovery_before_agent_build(
-        logger=logging.getLogger(__name__),
-        single_query=True,
-    )
+        ensure_mcp_discovery_before_agent_build(
+            logger=logging.getLogger(__name__),
+            single_query=True,
+        )
 
-    session_db = _create_session_db_for_oneshot()
+    # Isolated mode never opens the session store: no SessionDB is constructed,
+    # so no session row, message, or token-count write can occur.
+    session_db = None if isolated else _create_session_db_for_oneshot()
     # The try spans agent construction (not just ``chat``) so the SQLite store
     # opened above is always closed — including when ``AIAgent(...)`` itself
     # raises on a provider/config error. The one-shot exit path hard-exits via
@@ -427,8 +497,33 @@ def _run_agent(
     try:
         # Read the effective fallback chain from profile config so oneshot
         # workers honour the same merge semantics as interactive CLI and
-        # gateway sessions.
-        _fb = get_fallback_chain(cfg)
+        # gateway sessions.  Isolated mode pins it off: a fallback would send
+        # the same prompt to a second provider the caller never named.
+        _fb = None if isolated else get_fallback_chain(cfg)
+
+        # Isolated-mode runtime contract, composed from the mechanisms that
+        # already exist rather than a parallel runtime. Passed as constructor
+        # arguments (not post-hoc attribute patches) so the guarantees hold
+        # for everything agent_init does during construction.
+        _isolated_kwargs = (
+            dict(
+                skip_context_files=True,      # no AGENTS.md/CLAUDE.md/.cursorrules
+                load_soul_identity=False,     # no SOUL.md
+                skip_memory=True,             # no memory read or write
+                skip_background_review=True,  # no background review fork
+                persist_session=False,        # no session/message persistence
+                minimal_system_prompt=True,   # generic identity only
+                api_max_attempts=1,           # exactly one HTTP attempt
+                checkpoints_enabled=False,    # no checkpoint artifacts
+                save_trajectories=False,      # no trajectory artifacts
+                # Suppresses the outbound side-effects the flags above don't
+                # cover: provider metadata pre-warm, the live context-length
+                # probe, and fallback activation.
+                isolated_runtime=True,
+            )
+            if isolated
+            else {}
+        )
 
         agent = AIAgent(
             api_key=runtime.get("api_key"),
@@ -455,6 +550,7 @@ def _run_agent(
             #   - dangerous-command approval → bypassed via HERMES_YOLO_MODE=1
             #   - skill secret capture → returns gracefully when no callback set
             clarify_callback=_oneshot_clarify_callback,
+            **_isolated_kwargs,
         )
 
         # Belt-and-braces: make sure AIAgent doesn't invoke any streaming
