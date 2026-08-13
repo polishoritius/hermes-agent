@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import sys
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -176,6 +177,14 @@ def _write_usage_file(path: Optional[str], result: dict, failure: Optional[str] 
 _WORKER_CONTEXT_ENV_VARS = ("HERMES_KANBAN_TASK", "HERMES_KANBAN_BOARD")
 
 
+def _diagnostic_slug(value: object) -> str:
+    """Return a single-line model/provider identifier or ``UNKNOWN``."""
+    candidate = str(value or "").strip()
+    if candidate and re.fullmatch(r"[A-Za-z0-9._:/+\-]+", candidate):
+        return candidate
+    return "UNKNOWN"
+
+
 def _isolated_precondition_error(
     toolsets: object, usage_file: Optional[str]
 ) -> Optional[str]:
@@ -216,6 +225,7 @@ def run_oneshot(
     toolsets: object = None,
     usage_file: Optional[str] = None,
     isolated: bool = False,
+    show_response_metadata: bool = False,
 ) -> int:
     """Execute a single prompt and print only the final content block.
 
@@ -233,6 +243,12 @@ def run_oneshot(
 
     Returns the exit code.  The caller owns process termination.
     """
+    if show_response_metadata and not isolated:
+        sys.stderr.write(
+            "hermes -z: --show-response-metadata requires --isolated.\n"
+        )
+        return 2
+
     # Silence every stdlib logger for the duration.  AIAgent, tools, and
     # provider adapters all log to stderr through the root logger; file
     # handlers added by setup_logging() keep working (they're attached to
@@ -334,6 +350,16 @@ def run_oneshot(
         return 1
 
     _write_usage_file(usage_file, result)
+
+    if show_response_metadata:
+        requested_model = _diagnostic_slug(result.get("model"))
+        response_model = _diagnostic_slug(result.get("response_model"))
+        routing_provider = _diagnostic_slug(result.get("provider"))
+        real_stderr.write("HTTP_STATUS=UNKNOWN\n")
+        real_stderr.write(f"REQUESTED_MODEL={requested_model}\n")
+        real_stderr.write(f"RESPONSE_MODEL={response_model}\n")
+        real_stderr.write(f"ROUTING_PROVIDER={routing_provider}\n")
+        real_stderr.flush()
 
     # Model text can contain lone UTF-16 surrogates (invalid in UTF-8). Writing
     # those to a real stdout TextIO raises UnicodeEncodeError and aborts with

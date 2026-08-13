@@ -30,6 +30,7 @@ from hermes_cli._parser import (
 FAKE_API_KEY = "sk-fake-DUMMY-not-a-real-credential"
 FAKE_BASE_URL = "http://127.0.0.1:9/v1"
 FAKE_MODEL = "vendor/test-model-v1"
+FAKE_RESPONSE_MODEL = "vendor/actual-model-v2"
 FAKE_PROVIDER = "openrouter"
 
 
@@ -77,7 +78,7 @@ def _fake_response(content: str = "FAKE_OK"):
             prompt_tokens_details=None,
             completion_tokens_details=None,
         ),
-        model=FAKE_MODEL,
+        model=FAKE_RESPONSE_MODEL,
         id="fake-response-id",
     )
 
@@ -717,3 +718,81 @@ class TestNoSideEffects:
             f for f in new_files if any(m in f.lower() for m in artifact_markers)
         ]
         assert not offenders, f"isolated run created runtime artifacts: {sorted(offenders)}"
+
+    def test_success_preserves_actual_model_without_metadata_network(
+        self, monkeypatch, capture_requests
+    ):
+        import agent.model_metadata as model_metadata
+
+        metadata_requests: list[object] = []
+        monkeypatch.setattr(
+            model_metadata.requests,
+            "get",
+            lambda *a, **k: metadata_requests.append((a, k)),
+        )
+
+        agent = _build_isolated_agent()
+        result = agent.run_conversation("hello")
+
+        assert len(capture_requests.calls) == 1
+        assert metadata_requests == []
+        assert result["model"] == FAKE_MODEL
+        assert result["response_model"] == FAKE_RESPONSE_MODEL
+
+
+class TestResponseMetadataDiagnostic:
+    def test_opt_in_uses_stderr_and_keeps_stdout_unchanged(self, monkeypatch, capsys):
+        secret_key = "SUPER_SECRET_TEST_KEY_DO_NOT_PRINT"
+        secret_prompt = "SECRET_PROMPT_SENTINEL_DO_NOT_PRINT"
+
+        def fake_run_agent(prompt, **kwargs):
+            assert prompt == secret_prompt
+            assert secret_key not in prompt
+            return (
+                "HERMES_P5_PROVIDER_OK",
+                {
+                    "model": "test/requested-model",
+                    "response_model": "test/provider-model",
+                    "provider": "openrouter",
+                },
+            )
+
+        monkeypatch.setattr(oneshot_mod, "_run_agent", fake_run_agent)
+        rc = oneshot_mod.run_oneshot(
+            secret_prompt,
+            isolated=True,
+            show_response_metadata=True,
+        )
+
+        captured = capsys.readouterr()
+        assert rc == 0
+        assert captured.out == "HERMES_P5_PROVIDER_OK\n"
+        assert captured.err == (
+            "HTTP_STATUS=UNKNOWN\n"
+            "REQUESTED_MODEL=test/requested-model\n"
+            "RESPONSE_MODEL=test/provider-model\n"
+            "ROUTING_PROVIDER=openrouter\n"
+        )
+        combined = captured.out + captured.err
+        assert secret_key not in combined
+        assert secret_prompt not in combined
+        assert "Authorization" not in combined
+
+    def test_default_output_has_no_metadata(self, monkeypatch, capsys):
+        monkeypatch.setattr(
+            oneshot_mod,
+            "_run_agent",
+            lambda prompt, **kwargs: (
+                "HERMES_P5_PROVIDER_OK",
+                {
+                    "model": "test/requested-model",
+                    "response_model": "test/provider-model",
+                    "provider": "openrouter",
+                },
+            ),
+        )
+
+        assert oneshot_mod.run_oneshot("prompt", isolated=True) == 0
+        captured = capsys.readouterr()
+        assert captured.out == "HERMES_P5_PROVIDER_OK\n"
+        assert captured.err == ""

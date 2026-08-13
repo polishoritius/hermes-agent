@@ -200,6 +200,7 @@ def _run_and_exit_oneshot(
     toolsets: object = None,
     usage_file: object = None,
     isolated: bool = False,
+    show_response_metadata: bool = False,
 ) -> None:
     try:
         from hermes_cli.oneshot import run_oneshot
@@ -211,6 +212,7 @@ def _run_and_exit_oneshot(
             toolsets=toolsets,
             usage_file=usage_file,
             isolated=isolated,
+            show_response_metadata=show_response_metadata,
         )
     except KeyboardInterrupt:
         rc = 130
@@ -11050,6 +11052,7 @@ def _try_fast_chat_launch() -> bool:
             toolsets=getattr(args, "toolsets", None),
             usage_file=getattr(args, "usage_file", None),
             isolated=getattr(args, "isolated_oneshot", False),
+            show_response_metadata=getattr(args, "show_response_metadata", False),
         )
 
     if (args.resume or args.continue_last) and args.command is None:
@@ -11108,6 +11111,7 @@ def _try_termux_fast_cli_launch() -> bool:
             toolsets=getattr(args, "toolsets", None),
             usage_file=getattr(args, "usage_file", None),
             isolated=getattr(args, "isolated_oneshot", False),
+            show_response_metadata=getattr(args, "show_response_metadata", False),
         )
 
     if (args.resume or args.continue_last) and args.command is None:
@@ -12806,6 +12810,7 @@ def main():
             toolsets=getattr(args, "toolsets", None),
             usage_file=getattr(args, "usage_file", None),
             isolated=getattr(args, "isolated_oneshot", False),
+            show_response_metadata=getattr(args, "show_response_metadata", False),
         )
 
     # Handle top-level --resume / --continue as shortcut to chat

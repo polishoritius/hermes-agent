@@ -180,6 +180,15 @@ def build_top_level_parser():
             "data is sent. Requires -z/--oneshot; erroring out otherwise."
         ),
     )
+    parser.add_argument(
+        "--show-response-metadata",
+        action="store_true",
+        default=False,
+        help=(
+            "One-shot mode only: print secret-safe response identity metadata "
+            "to stderr after completion. Stdout remains response text only."
+        ),
+    )
     # --model / --provider are accepted at the top level so they can pair
     # with -z without needing the `chat` subcommand.  If neither -z nor a
     # subcommand consumes them, they fall through harmlessly as None.

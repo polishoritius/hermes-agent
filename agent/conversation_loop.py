@@ -1482,6 +1482,7 @@ def run_conversation(
     Returns:
         Dict: Complete conversation result with final response and message history
     """
+    agent._last_response_model = None
     if moa_config is None:
         try:
             from hermes_cli.moa_config import decode_moa_turn
@@ -2790,6 +2791,9 @@ def run_conversation(
                     break
                 
                 api_duration = time.time() - api_start_time
+                _response_model = getattr(response, "model", None)
+                if isinstance(_response_model, str) and _response_model.strip():
+                    agent._last_response_model = _response_model.strip()
                 
                 # Stop thinking spinner silently -- the response box or tool
                 # execution messages that follow are more informative.
@@ -3715,6 +3719,9 @@ def run_conversation(
                         provider=_agg_cost_provider,
                         base_url=_agg_cost_base_url,
                         api_key=getattr(agent, "api_key", ""),
+                        metadata_read_only=bool(
+                            getattr(agent, "_isolated_runtime", False)
+                        ),
                     )
                     if cost_result.amount_usd is not None:
                         agent.session_estimated_cost_usd += float(cost_result.amount_usd)
