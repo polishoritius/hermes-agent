@@ -76,6 +76,12 @@ class _FakeClient:
         return None
 
 
+class _FakeHTTPError(RuntimeError):
+    def __init__(self, status_code):
+        super().__init__(f"simulated HTTP {status_code}")
+        self.status_code = status_code
+
+
 def _isolated_agent(fake_client):
     from run_agent import AIAgent
 
@@ -113,6 +119,12 @@ class IsolatedOneShotStreamingTests(unittest.TestCase):
         self.home = Path(self._tmp.name)
         self._env = patch.dict(os.environ, {"HERMES_HOME": str(self.home)}, clear=False)
         self._env.start()
+        # Build the ordinary profile skeleton before the runtime snapshot.  It
+        # is profile bootstrap state, not a one-shot artifact; snapshots below
+        # then prove the isolated execution adds neither files nor directories.
+        from hermes_cli.config import ensure_hermes_home
+
+        ensure_hermes_home()
         self._network = patch.multiple(
             socket.socket,
             connect=lambda *_a, **_k: (_ for _ in ()).throw(
@@ -135,6 +147,12 @@ class IsolatedOneShotStreamingTests(unittest.TestCase):
         agent = _isolated_agent(client)
         self._agents.append(agent)
         return agent
+
+    def _snapshot(self):
+        return {
+            ("dir" if path.is_dir() else "file", path.relative_to(self.home))
+            for path in self.home.rglob("*")
+        }
 
     def test_streaming_uses_isolated_agent_without_session_or_memory(self):
         client = _FakeClient()
@@ -204,6 +222,89 @@ class IsolatedOneShotStreamingTests(unittest.TestCase):
         self.assertFalse(any("state.db" in str(p) for p in new_files))
         self.assertFalse(any("session" in str(p).lower() for p in new_files))
         self.assertFalse(any("memory" in str(p).lower() for p in new_files))
+
+    def test_isolated_failure_matrix_has_zero_filesystem_delta(self):
+        """Every provider failure shape is denied at the dump boundary."""
+        (self.home / "SOUL.md").write_text("fixture", encoding="utf-8")
+        failures = (
+            ("http_404", _FakeHTTPError(404)),
+            ("http_400", _FakeHTTPError(400)),
+            ("http_401", _FakeHTTPError(401)),
+            ("timeout", TimeoutError("simulated timeout")),
+            ("transport", ConnectionError("simulated transport exception")),
+            ("streaming", RuntimeError("simulated streaming failure")),
+        )
+        for label, error in failures:
+            with self.subTest(label=label):
+                before = self._snapshot()
+                agent = self._agent(_FakeClient(error=error))
+                agent.run_conversation("fictional input")
+                self.assertEqual(self._snapshot(), before)
+                self.assertEqual(list((self.home / "sessions").glob("request_dump_*.json")), [])
+
+    def test_isolated_nonstreaming_failure_has_zero_filesystem_delta(self):
+        (self.home / "SOUL.md").write_text("fixture", encoding="utf-8")
+        before = self._snapshot()
+        agent = self._agent(_FakeClient())
+        agent._disable_streaming = True
+
+        def fail_nonstreaming(*_args, **_kwargs):
+            raise _FakeHTTPError(404)
+
+        with patch(
+            "agent.chat_completion_helpers._dispatch_nonstreaming_api_request",
+            fail_nonstreaming,
+        ):
+            agent.run_conversation("fictional input")
+
+        self.assertEqual(self._snapshot(), before)
+        self.assertEqual(list((self.home / "sessions").glob("request_dump_*.json")), [])
+
+    def test_isolation_overrides_dump_requests_environment(self):
+        (self.home / "SOUL.md").write_text("fixture", encoding="utf-8")
+        before = self._snapshot()
+        with patch.dict(os.environ, {"HERMES_DUMP_REQUESTS": "1"}, clear=False):
+            agent = self._agent(_FakeClient())
+            agent.run_conversation("fictional input")
+        self.assertEqual(self._snapshot(), before)
+        self.assertEqual(list((self.home / "sessions").glob("request_dump_*.json")), [])
+
+    def test_isolated_dump_boundary_never_persists_headers(self):
+        agent = self._agent(_FakeClient())
+        with patch(
+            "agent.agent_runtime_helpers.atomic_json_write",
+            side_effect=AssertionError("isolated dump reached filesystem writer"),
+        ):
+            result = agent._dump_api_request_debug(
+                {
+                    "model": FAKE_MODEL,
+                    "messages": [{"role": "user", "content": "fictional input"}],
+                },
+                reason="test",
+            )
+        self.assertIsNone(result)
+        self.assertEqual(list((self.home / "sessions").glob("request_dump_*.json")), [])
+
+    def test_isolated_agent_does_not_create_missing_logs_directory(self):
+        sessions = self.home / "sessions"
+        sessions.rmdir()
+        self.assertFalse(sessions.exists())
+        self._agent(_FakeClient())
+        self.assertFalse(sessions.exists())
+
+    def test_normal_mode_debug_dump_behavior_is_unchanged(self):
+        agent = self._agent(_FakeClient())
+        agent._isolated_runtime = False
+        agent.logs_dir = self.home / "normal-sessions"
+        dump = agent._dump_api_request_debug(
+            {
+                "model": FAKE_MODEL,
+                "messages": [{"role": "user", "content": "fictional input"}],
+            },
+            reason="test",
+        )
+        self.assertIsNotNone(dump)
+        self.assertTrue(dump.exists())
 
     def test_streaming_and_nonstreaming_share_isolation_request(self):
         stream_client = _FakeClient()

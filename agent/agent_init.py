@@ -1567,18 +1567,22 @@ def init_agent(
     # Session logs go into ~/.hermes/sessions/ alongside gateway sessions
     hermes_home = get_hermes_home()
     agent.logs_dir = hermes_home / "sessions"
-    agent.logs_dir.mkdir(parents=True, exist_ok=True)
+    # Isolated one-shot promises zero Hermes-managed persistent writes.  Keep
+    # the path available for shared runtime code, but do not create it here.
+    if not isolated_runtime:
+        agent.logs_dir.mkdir(parents=True, exist_ok=True)
     # Per-session JSON snapshot writer (~/.hermes/sessions/session_{sid}.json)
     # is opt-in via sessions.write_json_snapshots (default False).  state.db
     # is canonical — the snapshot is only useful for external tooling that
     # reads the JSON files directly.  See run_agent._save_session_log.
     agent._session_json_enabled = False
-    try:
-        from hermes_cli.config import load_config_readonly as _load_sess_cfg
-        _sess_cfg = (_load_sess_cfg().get("sessions") or {})
-        agent._session_json_enabled = bool(_sess_cfg.get("write_json_snapshots", False))
-    except Exception:
-        pass
+    if not isolated_runtime:
+        try:
+            from hermes_cli.config import load_config_readonly as _load_sess_cfg
+            _sess_cfg = (_load_sess_cfg().get("sessions") or {})
+            agent._session_json_enabled = bool(_sess_cfg.get("write_json_snapshots", False))
+        except Exception:
+            pass
     # logs_dir is retained unconditionally for request_dump_*.json (debug
     # breadcrumb path written by agent_runtime_helpers.dump_api_request_debug).
     
