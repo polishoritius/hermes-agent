@@ -7978,7 +7978,10 @@ class AIAgent:
             # web_extract, session_search, MoA slots, background-review forks
             # (which copy this Context into their thread) — inherits the
             # ``conversation=<root>`` tag with zero per-call-site plumbing.
-            token = set_conversation_context(self._conversation_root_id())
+            token = set_conversation_context(
+                "" if getattr(self, "_isolated_runtime", False)
+                else self._conversation_root_id()
+            )
             # Publish the session accounting handles the same way so auxiliary
             # calls record their token usage into session_model_usage (task
             # dimension) — the fix for aux spend being invisible in analytics
