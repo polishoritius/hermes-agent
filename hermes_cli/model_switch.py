@@ -33,6 +33,7 @@ from hermes_cli.providers import (
     get_label,
     host_mandated_api_mode,
     is_aggregator,
+    normalize_provider,
     resolve_provider_full,
 )
 from hermes_cli.model_normalize import (
@@ -2131,7 +2132,13 @@ def list_authenticated_providers(
 
     results: List[dict] = []
     seen_slugs: set = set()  # lowercase-normalized to catch case variants (#9545)
-    _current_provider_norm = str(current_provider or "").strip().lower()
+    # Resolve provider aliases (ollama -> custom, vllm/llamacpp -> local, ...)
+    # through providers.py's own ALIASES table before any current-provider
+    # comparison below. Without this, current_provider="ollama" never matches
+    # the literal "custom"/"local" checks that decide whether to build/probe
+    # the current custom-endpoint row -- even though runtime_provider.py
+    # already resolves that same alias correctly at actual inference time.
+    _current_provider_norm = normalize_provider(current_provider or "")
     _current_base_url_norm = str(current_base_url or "").strip().rstrip("/").lower()
 
     def _can_probe_custom_provider(*, row_is_current: bool) -> bool:
