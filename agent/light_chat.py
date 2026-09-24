@@ -10,6 +10,22 @@ Never falls back to another provider. A connection failure raises
 LightChatUnavailableError -- callers must surface this as an explicit
 error, not retry against openrouter/anthropic/etc.
 
+Transport (HERMES-FAST-ROUTER-001 PHASE 4): the production path talks
+to native Ollama `/api/chat` (not the OpenAI-compatible `/v1` route),
+because `keep_alive` is only honored there -- confirmed empirically by
+querying `/api/ps`'s `expires_at` after a call with
+`extra_body={"keep_alive": "30m"}` through the OpenAI SDK against
+`/v1/chat/completions`: the model still expired at the default ~5m
+mark, proving the OpenAI-compatible endpoint silently drops that
+field. This module's own `_call_native_ollama_chat()` mirrors
+scripts/persona_chatter.py's `_call_ollama_chat()` pattern
+independently -- neither Full Agent's provider code
+(agent/agent_init.py, agent/agent_runtime_helpers.py) nor CHATTER's
+own implementation is touched by this change; it is a Light-Chat-only
+transport swap. The `client_factory` parameter remains as a test/
+advanced-override seam using the OpenAI SDK shape, unchanged from
+HERMES-LIGHT-CHAT-001.
+
 History is kept in a small per-session JSON file under
 HERMES_HOME/light_chat_sessions/, capped at MAX_HISTORY_MESSAGES. This
 is deliberately separate from hermes_state.SessionDB (state.db): that
@@ -30,6 +46,12 @@ DEFAULT_MODEL = "llama3.2:3b"
 DEFAULT_PROVIDER = "custom"
 DEFAULT_BASE_URL = "http://localhost:11434/v1"
 DEFAULT_SESSION_ID = "default"
+
+# CHATTER uses "5m" (scripts/persona_chatter.py); Light Chat is meant to
+# stay resident for a full interactive session, not just a few CHATTER
+# turns, so it defaults higher. Only takes effect via the native
+# /api/chat transport -- see module docstring.
+DEFAULT_KEEP_ALIVE = "30m"
 
 # 4 user/assistant turns == 8 messages.
 MAX_HISTORY_MESSAGES = 8
@@ -103,6 +125,46 @@ def _build_system_prompt(hermes_home: Path) -> str:
     return LIGHT_CHAT_BOUNDARY_PROMPT
 
 
+def _native_chat_url(base_url: str) -> str:
+    """Derives the native Ollama /api/chat URL from the configured
+    OpenAI-compatible base_url (e.g. "http://localhost:11434/v1" ->
+    "http://localhost:11434/api/chat"). Purely a URL transform -- the
+    caller-visible `base_url` value reported in run_light_chat()'s
+    return dict is left unchanged (matches Hermes's configured
+    provider identity)."""
+    trimmed = base_url.rstrip("/")
+    if trimmed.endswith("/v1"):
+        trimmed = trimmed[: -len("/v1")]
+    return f"{trimmed}/api/chat"
+
+
+def _call_native_ollama_chat(
+    *, messages: list[dict[str, str]], model: str, base_url: str, keep_alive: str,
+) -> dict[str, Any]:
+    """Native Ollama /api/chat call. Same request/response shape as
+    scripts/persona_chatter.py::_call_ollama_chat -- kept as an
+    independent implementation here (never imports persona_chatter.py)
+    so CHATTER's own code is never touched by a Light Chat change."""
+    import json as _json
+    import urllib.request as _urllib_request
+
+    payload = _json.dumps({
+        "model": model, "messages": messages, "stream": False, "keep_alive": keep_alive,
+    }).encode("utf-8")
+    request = _urllib_request.Request(
+        _native_chat_url(base_url), data=payload, method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    with _urllib_request.urlopen(request, timeout=280) as response:
+        body = _json.loads(response.read().decode("utf-8"))
+    message = body.get("message") or {}
+    return {
+        "response_text": message.get("content") or "",
+        "prompt_tokens": body.get("prompt_eval_count"),
+        "output_tokens": body.get("eval_count"),
+    }
+
+
 def run_light_chat(
     query: str,
     *,
@@ -110,6 +172,7 @@ def run_light_chat(
     provider: str = DEFAULT_PROVIDER,
     base_url: str = DEFAULT_BASE_URL,
     api_key: str = "",
+    keep_alive: str = DEFAULT_KEEP_ALIVE,
     session_id: str = DEFAULT_SESSION_ID,
     hermes_home: Optional[Path] = None,
     client_factory: Optional[Callable[[], Any]] = None,
@@ -134,29 +197,36 @@ def run_light_chat(
         + [{"role": "user", "content": query}]
     )
 
-    if client_factory is None:
-        import openai
-
-        def client_factory():
-            return openai.OpenAI(base_url=base_url, api_key=api_key or "no-key", max_retries=0)
-
     try:
-        client = client_factory()
-        t0 = time.time()
-        response = client.chat.completions.create(model=model, messages=messages)
-        latency_s = time.time() - t0
+        if client_factory is not None:
+            # Test / advanced-override seam: OpenAI-SDK-shaped client,
+            # unchanged from HERMES-LIGHT-CHAT-001.
+            client = client_factory()
+            t0 = time.time()
+            response = client.chat.completions.create(model=model, messages=messages)
+            latency_s = time.time() - t0
+            choice = response.choices[0]
+            text = (choice.message.content or "").strip()
+            usage = getattr(response, "usage", None)
+            prompt_tokens = getattr(usage, "prompt_tokens", None) if usage else None
+            output_tokens = getattr(usage, "completion_tokens", None) if usage else None
+        else:
+            # Production path: native Ollama /api/chat so keep_alive is
+            # actually honored (see module docstring).
+            t0 = time.time()
+            native_result = _call_native_ollama_chat(
+                messages=messages, model=model, base_url=base_url, keep_alive=keep_alive,
+            )
+            latency_s = time.time() - t0
+            text = native_result["response_text"].strip()
+            prompt_tokens = native_result["prompt_tokens"]
+            output_tokens = native_result["output_tokens"]
     except Exception as exc:  # noqa: BLE001 -- converted to an explicit
         # error type; this except block never attempts another
         # provider/base_url.
         raise LightChatUnavailableError(
             f"Light Chat: local endpoint unavailable (provider={provider} base_url={base_url} model={model}): {exc}"
         ) from exc
-
-    choice = response.choices[0]
-    text = (choice.message.content or "").strip()
-    usage = getattr(response, "usage", None)
-    prompt_tokens = getattr(usage, "prompt_tokens", None) if usage else None
-    output_tokens = getattr(usage, "completion_tokens", None) if usage else None
 
     new_history = history + [
         {"role": "user", "content": query},
@@ -190,12 +260,22 @@ _PP_PERSONA_PREFIX = "/pp persona "
 _PP_CHATTER_PREFIX = "/pp chatter "
 
 
-def handle_light_input(text: str, **run_light_chat_kwargs: Any) -> dict[str, Any]:
-    """Single entry point for the Light Chat CLI path: routes an
-    explicit "/pp ..." command to agent/pp_context_bridge.py (read +
-    explicit CHATTER dispatch only), otherwise forwards unchanged to
-    run_light_chat(). The returned dict always carries "kind" so the
-    caller knows how to render it ("pp_bridge" vs "light_chat")."""
+def handle_light_input(
+    text: str, *, pp_repo_path: Optional[str] = None, **run_light_chat_kwargs: Any
+) -> dict[str, Any]:
+    """Single entry point for the Light Chat CLI path.
+
+    Dispatch order (HERMES-FAST-ROUTER-001):
+      1. Explicit "/pp ..." commands -- unchanged from
+         PP-CONTEXT-BRIDGE-001, always take priority, raw structured
+         output ("kind": "pp_bridge").
+      2. agent/fast_router.py's deterministic (no-LLM) classifier for
+         natural-language Persona list/lookup/CHATTER requests --
+         "kind": "pp_bridge_natural", rendered with
+         agent/pp_bridge_formatter.py's plain-text formatters.
+      3. Everything else -- run_light_chat() exactly as before
+         ("kind": "light_chat").
+    """
     stripped = (text or "").strip()
 
     if stripped == _PP_PERSONAS_PREFIX or stripped.startswith(_PP_PERSONAS_PREFIX + " "):
@@ -223,7 +303,54 @@ def handle_light_input(text: str, **run_light_chat_kwargs: Any) -> dict[str, Any
         result = start_chatter(args[0], args[1])
         return {"kind": "pp_bridge", "command": "chatter", "data": result, "external_api_calls": 0}
 
-    # Not a /pp command -- ordinary Light Chat, Bridge is never touched.
+    # Not an explicit /pp command -- try the deterministic Fast Router
+    # before falling back to ordinary Light Chat.
+    from agent import fast_router
+
+    decision = fast_router.route(stripped, pp_repo_path)
+    route_kind = decision["route"]
+
+    if route_kind == fast_router.ROUTE_PERSONA_LIST:
+        from agent.pp_bridge_formatter import format_persona_list
+        from agent.pp_context_bridge import list_personas
+
+        data = list_personas()
+        return {
+            "kind": "pp_bridge_natural",
+            "command": "personas",
+            "data": data,
+            "formatted_text": format_persona_list(data),
+            "external_api_calls": 0,
+        }
+
+    if route_kind == fast_router.ROUTE_PERSONA_LOOKUP:
+        from agent.pp_bridge_formatter import format_persona
+        from agent.pp_context_bridge import get_persona
+
+        query = decision["query"]
+        data = get_persona(query)
+        return {
+            "kind": "pp_bridge_natural",
+            "command": "persona",
+            "data": data,
+            "formatted_text": format_persona(data, query=query),
+            "external_api_calls": 0,
+        }
+
+    if route_kind == fast_router.ROUTE_CHATTER:
+        from agent.pp_bridge_formatter import format_chatter
+        from agent.pp_context_bridge import start_chatter
+
+        data = start_chatter(decision["persona_a"], decision["persona_b"], max_turns=2)
+        return {
+            "kind": "pp_bridge_natural",
+            "command": "chatter",
+            "data": data,
+            "formatted_text": format_chatter(data),
+            "external_api_calls": 0,
+        }
+
+    # ROUTE_LIGHT_CHAT (default) -- ordinary Light Chat, Bridge is never touched.
     result = run_light_chat(text, **run_light_chat_kwargs)
     result["kind"] = "light_chat"
     return result

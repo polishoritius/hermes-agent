@@ -185,3 +185,61 @@ class CliLightFlagStructuralTests(unittest.TestCase):
         src = self._read_cli_source()
         light_branch = src[src.find("if light:") : src.find("if light:") + 1500]
         self.assertIn("return", light_branch)
+
+
+class NativeTransportKeepAliveTests(unittest.TestCase):
+    """HERMES-FAST-ROUTER-001 PHASE 4: the production path (no
+    client_factory override) must use native Ollama /api/chat with
+    keep_alive, not the OpenAI-compatible /v1 endpoint (empirically
+    confirmed to silently drop keep_alive -- see module docstring).
+    Mocks agent.light_chat._call_native_ollama_chat, so this test
+    makes zero network calls."""
+
+    def test_default_path_calls_native_transport_with_keep_alive(self):
+        import tempfile
+        from unittest.mock import patch
+
+        fake = {"response_text": "hi", "prompt_tokens": 10, "output_tokens": 2}
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("agent.light_chat._call_native_ollama_chat", return_value=fake) as mock_call:
+                result = light_chat.run_light_chat("こんにちは", hermes_home=Path(tmp))
+
+        mock_call.assert_called_once()
+        kwargs = mock_call.call_args.kwargs
+        self.assertEqual(kwargs["keep_alive"], light_chat.DEFAULT_KEEP_ALIVE)
+        self.assertEqual(kwargs["model"], light_chat.DEFAULT_MODEL)
+        self.assertEqual(result["text"], "hi")
+        self.assertEqual(result["prompt_tokens"], 10)
+        self.assertEqual(result["output_tokens"], 2)
+
+    def test_client_factory_override_still_uses_openai_sdk_shape(self):
+        """Backward compatibility: every existing test in this file
+        passes an explicit client_factory and must be unaffected by
+        the PHASE 4 transport change."""
+        import tempfile
+
+        capture = {}
+
+        def factory():
+            return _mock_client_factory("ok", capture)()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            result = light_chat.run_light_chat("hi", hermes_home=Path(tmp), client_factory=factory)
+        self.assertEqual(result["text"], "ok")
+        self.assertEqual(capture["call_count"], 1)
+
+    def test_native_chat_url_strips_v1_suffix(self):
+        self.assertEqual(
+            light_chat._native_chat_url("http://localhost:11434/v1"), "http://localhost:11434/api/chat"
+        )
+
+    def test_native_chat_url_handles_no_v1_suffix(self):
+        self.assertEqual(
+            light_chat._native_chat_url("http://localhost:11434"), "http://localhost:11434/api/chat"
+        )
+
+    def test_default_keep_alive_is_longer_than_chatter(self):
+        """CHATTER (scripts/persona_chatter.py) uses "5m"; Light Chat
+        is meant to stay resident for a whole interactive session, so
+        it defaults higher -- documented decision, not a guess."""
+        self.assertEqual(light_chat.DEFAULT_KEEP_ALIVE, "30m")
