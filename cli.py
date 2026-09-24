@@ -18806,6 +18806,8 @@ def main(
         if result.get("kind") == "pp_bridge":
             import json as _json
             print(_json.dumps(result["data"], ensure_ascii=False, indent=2))
+        elif result.get("kind") == "pp_bridge_natural":
+            print(result["formatted_text"])
         else:
             print(result["text"])
         return
