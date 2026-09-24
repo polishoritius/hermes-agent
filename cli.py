@@ -18381,10 +18381,11 @@ def main(
     pass_session_id: bool = False,
     ignore_user_config: bool = False,
     ignore_rules: bool = False,
+    light: bool = False,
 ):
     """
     Hermes Agent CLI - Interactive AI Assistant
-    
+
     Args:
         query: Single query to execute (then exit). Alias: -q
         q: Shorthand for --query
@@ -18404,7 +18405,13 @@ def main(
         resume: Resume a previous session by its ID (e.g., 20260225_143052_a1b2c3)
         worktree: Run in an isolated git worktree (for parallel agents). Alias: -w
         w: Shorthand for --worktree
-    
+        light: Light Chat fast path -- skips the normal agent bootstrap
+            (no tools, no tool_search, no skills, no MCP discovery) and
+            talks directly to a local OpenAI-compatible endpoint.
+            Requires --query/-q. Defaults to provider=custom,
+            model=llama3.2:3b, base_url=http://localhost:11434/v1
+            unless overridden by --model/--provider/--base_url.
+
     Examples:
         python cli.py                            # Start interactive mode
         python cli.py --toolsets web,terminal    # Use specific toolsets
@@ -18415,6 +18422,7 @@ def main(
         python cli.py --resume 20260225_143052_a1b2c3  # Resume session
         python cli.py -w                         # Start in isolated git worktree
         python cli.py -w -q "Fix issue #123"     # Single query in worktree
+        python cli.py --light -q "こんにちは"     # Light Chat fast path (local Ollama, no tools)
     """
     global _active_worktree
 
@@ -18437,6 +18445,37 @@ def main(
         from gateway.run import start_gateway
         print("Starting Hermes Gateway (messaging platforms)...")
         asyncio.run(start_gateway())
+        return
+
+    # Light Chat fast path (HERMES-LIGHT-CHAT-001) -- deliberately
+    # placed before HermesCLI() / worktree / skills-preload / MCP
+    # discovery so it never triggers any of that bootstrap. Never
+    # falls back to another provider: a connection failure is printed
+    # and exits non-zero.
+    if light:
+        light_query = query or q
+        if not light_query:
+            print("--light requires --query/-q (Light Chat is single-query only).")
+            raise SystemExit(2)
+        from agent.light_chat import (
+            DEFAULT_BASE_URL as _LC_BASE_URL,
+            DEFAULT_MODEL as _LC_MODEL,
+            DEFAULT_PROVIDER as _LC_PROVIDER,
+            LightChatUnavailableError,
+            run_light_chat,
+        )
+        try:
+            result = run_light_chat(
+                light_query,
+                model=model or _LC_MODEL,
+                provider=provider or _LC_PROVIDER,
+                base_url=base_url or _LC_BASE_URL,
+                api_key=api_key or "",
+            )
+        except LightChatUnavailableError as exc:
+            print(f"Light Chat error: {exc}")
+            raise SystemExit(1)
+        print(result["text"])
         return
 
     # Skip worktree for list commands (they exit immediately)
