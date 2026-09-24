@@ -18790,10 +18790,10 @@ def main(
             DEFAULT_MODEL as _LC_MODEL,
             DEFAULT_PROVIDER as _LC_PROVIDER,
             LightChatUnavailableError,
-            run_light_chat,
+            handle_light_input,
         )
         try:
-            result = run_light_chat(
+            result = handle_light_input(
                 light_query,
                 model=model or _LC_MODEL,
                 provider=provider or _LC_PROVIDER,
@@ -18803,7 +18803,11 @@ def main(
         except LightChatUnavailableError as exc:
             print(f"Light Chat error: {exc}")
             raise SystemExit(1)
-        print(result["text"])
+        if result.get("kind") == "pp_bridge":
+            import json as _json
+            print(_json.dumps(result["data"], ensure_ascii=False, indent=2))
+        else:
+            print(result["text"])
         return
 
     # Skip worktree for list commands (they exit immediately)
