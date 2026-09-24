@@ -176,3 +176,54 @@ def run_light_chat(
         "tool_calls": 0,
         "external_api_calls": 0,
     }
+
+
+# ── PP Context Bridge command routing (PP-CONTEXT-BRIDGE-001) ──────────
+#
+# Explicit-command dispatch ONLY -- a hard "/pp ..." prefix check, never
+# natural-language intent classification (explicit non-goal). Anything
+# that doesn't start with "/pp " goes to run_light_chat() exactly as
+# before -- ordinary greetings/questions never reach the Bridge.
+
+_PP_PERSONAS_PREFIX = "/pp personas"
+_PP_PERSONA_PREFIX = "/pp persona "
+_PP_CHATTER_PREFIX = "/pp chatter "
+
+
+def handle_light_input(text: str, **run_light_chat_kwargs: Any) -> dict[str, Any]:
+    """Single entry point for the Light Chat CLI path: routes an
+    explicit "/pp ..." command to agent/pp_context_bridge.py (read +
+    explicit CHATTER dispatch only), otherwise forwards unchanged to
+    run_light_chat(). The returned dict always carries "kind" so the
+    caller knows how to render it ("pp_bridge" vs "light_chat")."""
+    stripped = (text or "").strip()
+
+    if stripped == _PP_PERSONAS_PREFIX or stripped.startswith(_PP_PERSONAS_PREFIX + " "):
+        from agent.pp_context_bridge import list_personas
+
+        return {"kind": "pp_bridge", "command": "personas", "data": list_personas(), "external_api_calls": 0}
+
+    if stripped.startswith(_PP_PERSONA_PREFIX):
+        query = stripped[len(_PP_PERSONA_PREFIX):].strip()
+        from agent.pp_context_bridge import get_persona
+
+        return {"kind": "pp_bridge", "command": "persona", "data": get_persona(query), "external_api_calls": 0}
+
+    if stripped.startswith(_PP_CHATTER_PREFIX):
+        args = stripped[len(_PP_CHATTER_PREFIX):].strip().split()
+        if len(args) != 2:
+            return {
+                "kind": "pp_bridge",
+                "command": "chatter",
+                "data": {"error": "USAGE: /pp chatter <persona_a> <persona_b>"},
+                "external_api_calls": 0,
+            }
+        from agent.pp_context_bridge import start_chatter
+
+        result = start_chatter(args[0], args[1])
+        return {"kind": "pp_bridge", "command": "chatter", "data": result, "external_api_calls": 0}
+
+    # Not a /pp command -- ordinary Light Chat, Bridge is never touched.
+    result = run_light_chat(text, **run_light_chat_kwargs)
+    result["kind"] = "light_chat"
+    return result
