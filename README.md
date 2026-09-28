@@ -2,6 +2,8 @@
   <img src="assets/banner.png" alt="Hermes Agent" width="100%">
 </p>
 
+> **This fork (`polishoritius/hermes-agent`) is RETIRED / ARCHIVED REFERENCE.** See [RETIREMENT.md](RETIREMENT.md) for status, the four local patches preserved here, and an important naming note if you arrived by searching "Hermes". The upstream project below is unaffected.
+
 # Hermes Agent ☤
 <p align="center">
   <a href="https://hermes-agent.nousresearch.com/">Hermes Agent</a> | <a href="https://hermes-agent.nousresearch.com/">Hermes Desktop</a>
